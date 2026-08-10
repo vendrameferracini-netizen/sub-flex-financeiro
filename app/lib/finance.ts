@@ -121,6 +121,14 @@ function periodReference(period: Period) {
   return `${period.ano}-${String(period.mes).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
 }
 
+function periodDateRange(period: Period) {
+  const lastDay = new Date(period.ano, period.mes, 0).getDate();
+  const startDay = period.tipo_periodo === "quinzenal" ? (period.numero_periodo === 1 ? 1 : 16) : 1 + (period.numero_periodo - 1) * 7;
+  const endDay = period.tipo_periodo === "quinzenal" ? (period.numero_periodo === 1 ? 15 : lastDay) : Math.min(startDay + 6, lastDay);
+  const prefix = `${period.ano}-${String(period.mes).padStart(2, "0")}-`;
+  return { start: `${prefix}${String(startDay).padStart(2, "0")}`, end: `${prefix}${String(endDay).padStart(2, "0")}` };
+}
+
 export async function previewCarrierReceiptMove(origin: Period, destination: Period) {
   if (samePeriod(origin, destination)) throw new Error("O período de destino deve ser diferente do período de origem.");
   const [{ data: source, error: sourceError }, { data: target, error: targetError }] = await Promise.all([
@@ -159,7 +167,7 @@ export async function loadRiderSheet(period: Period) {
   const [{ data: riders, error: riderError }, { data: payments, error: paymentError }, { data: discounts, error: discountError }] = await Promise.all([
     db().from("motoboys").select("id,nome,tipo_pagamento,ativo").eq("ativo", true).order("nome"),
     db().from("pagamentos_motoboys").select("*").match(period),
-    db().from("vales_extravios").select("id,motoboy_id,tipo,valor").eq("status", "pendente").eq("mes_desconto", period.mes).eq("ano_desconto", period.ano),
+    db().from("vales_extravios").select("id,motoboy_id,tipo,valor").eq("status", "pendente").eq("mes_desconto", period.mes).eq("ano_desconto", period.ano).eq("periodo_desconto", period.numero_periodo),
   ]);
   if (riderError) throw riderError;
   if (paymentError) throw paymentError;
@@ -185,8 +193,9 @@ export async function currentUserId() {
   return data.user?.id ?? null;
 }
 
-export async function loadCosts(mes: number, ano: number) {
-  const { data, error } = await db().from("custos").select("*,socios(nome)").eq("mes", mes).eq("ano", ano).neq("status", "cancelado").order("data", { ascending: false });
+export async function loadCosts(period: Period) {
+  const range = periodDateRange(period);
+  const { data, error } = await db().from("custos").select("*,socios(nome)").eq("mes", period.mes).eq("ano", period.ano).gte("data", range.start).lte("data", range.end).neq("status", "cancelado").order("data", { ascending: false });
   if (error) throw error;
   return data ?? [];
 }
@@ -204,8 +213,8 @@ export async function cancelRecord(table: "custos" | "vales_extravios" | "repass
   if (error) throw error;
 }
 
-export async function loadAdvances(mes: number, ano: number) {
-  const { data, error } = await db().from("vales_extravios").select("*,motoboys(id,nome),socios(nome)").eq("mes_desconto", mes).eq("ano_desconto", ano).neq("status", "cancelado").order("data", { ascending: false });
+export async function loadAdvances(period: Period) {
+  const { data, error } = await db().from("vales_extravios").select("*,motoboys!inner(id,nome,tipo_pagamento),socios(nome)").eq("motoboys.tipo_pagamento", period.tipo_periodo).eq("mes_desconto", period.mes).eq("ano_desconto", period.ano).eq("periodo_desconto", period.numero_periodo).neq("status", "cancelado").order("data", { ascending: false });
   if (error) throw error;
   return data ?? [];
 }
@@ -237,10 +246,11 @@ export async function saveSettings(values: Record<string, string>) {
 }
 
 export async function loadFinancialSummary(period: Period) {
+  const range = periodDateRange(period);
   const [{ data: receipts, error: e1 }, { data: payments, error: e2 }, { data: costs, error: e3 }, { data: partners, error: e4 }] = await Promise.all([
     db().from("recebimentos_transportadoras").select("valor,status,recebido_por_socio_id").match(period).neq("status", "cancelado"),
     db().from("pagamentos_motoboys").select("valor_liquido,status,pago_por_socio_id").match(period).neq("status", "cancelado"),
-    db().from("custos").select("valor,status,pago_por_socio_id").eq("mes", period.mes).eq("ano", period.ano).neq("status", "cancelado"),
+    db().from("custos").select("valor,status,pago_por_socio_id").eq("mes", period.mes).eq("ano", period.ano).gte("data", range.start).lte("data", range.end).neq("status", "cancelado"),
     db().from("socios").select("id,nome,percentual_participacao").eq("ativo", true),
   ]);
   if (e1 || e2 || e3 || e4) throw e1 || e2 || e3 || e4;
