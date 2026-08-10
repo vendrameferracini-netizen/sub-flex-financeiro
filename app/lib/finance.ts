@@ -14,7 +14,50 @@ export async function listPartners() {
   return data ?? [];
 }
 
+export async function createCarrier(nome: string, tipoPagamento: "semanal" | "quinzenal") {
+  const normalizedName = nome.trim().replace(/\s+/g, " ").toUpperCase();
+  if (!normalizedName) throw new Error("Informe o nome da transportadora.");
+  const { data: existing, error: lookupError } = await db()
+    .from("transportadoras")
+    .select("id")
+    .ilike("nome", normalizedName)
+    .limit(1)
+    .maybeSingle();
+  if (lookupError) throw lookupError;
+  if (existing) throw new Error("Esta transportadora já está cadastrada.");
+  const { data, error } = await db()
+    .from("transportadoras")
+    .insert({ nome: normalizedName, tipo_pagamento: tipoPagamento, ativo: true })
+    .select("id,nome,tipo_pagamento,ativo")
+    .single();
+  if (error?.code === "23505") throw new Error("Esta transportadora já está cadastrada.");
+  if (error) throw error;
+  return data;
+}
+
+async function ensureFastCarrier() {
+  const { data, error } = await db()
+    .from("transportadoras")
+    .select("id,nome,tipo_pagamento,ativo")
+    .ilike("nome", "FAST")
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  if (!data) {
+    const { error: insertError } = await db().from("transportadoras").insert({ nome: "FAST", tipo_pagamento: "quinzenal", ativo: true });
+    if (insertError?.code !== "23505") {
+      if (insertError) throw insertError;
+    }
+    return;
+  }
+  if (data.nome !== "FAST" || data.tipo_pagamento !== "quinzenal" || !data.ativo) {
+    const { error: updateError } = await db().from("transportadoras").update({ nome: "FAST", tipo_pagamento: "quinzenal", ativo: true }).eq("id", data.id);
+    if (updateError) throw updateError;
+  }
+}
+
 export async function loadCarrierSheet(period: Period) {
+  await ensureFastCarrier();
   const [{ data: carriers, error: carrierError }, { data: receipts, error: receiptError }] = await Promise.all([
     db().from("transportadoras").select("id,nome,tipo_pagamento,ativo").eq("ativo", true).order("nome"),
     db().from("recebimentos_transportadoras").select("*").match(period),
