@@ -110,6 +110,51 @@ export async function saveCarrierReceipts(rows: Array<Record<string, unknown>>) 
   if (error) throw error;
 }
 
+function samePeriod(a: Period, b: Period) {
+  return a.tipo_periodo === b.tipo_periodo && a.numero_periodo === b.numero_periodo && a.mes === b.mes && a.ano === b.ano;
+}
+
+function periodReference(period: Period) {
+  const requestedDay = period.tipo_periodo === "quinzenal" ? (period.numero_periodo === 1 ? 1 : 16) : 1 + (period.numero_periodo - 1) * 7;
+  const lastDay = new Date(period.ano, period.mes, 0).getDate();
+  const day = Math.min(requestedDay, lastDay);
+  return `${period.ano}-${String(period.mes).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+export async function previewCarrierReceiptMove(origin: Period, destination: Period) {
+  if (samePeriod(origin, destination)) throw new Error("O período de destino deve ser diferente do período de origem.");
+  const [{ data: source, error: sourceError }, { data: target, error: targetError }] = await Promise.all([
+    db().from("recebimentos_transportadoras").select("transportadora_id").match(origin),
+    db().from("recebimentos_transportadoras").select("transportadora_id").match(destination),
+  ]);
+  if (sourceError) throw sourceError;
+  if (targetError) throw targetError;
+  const sourceIds = [...new Set((source ?? []).map(row => row.transportadora_id))];
+  if (!sourceIds.length) throw new Error("Não há lançamentos no período de origem.");
+  const targetIds = new Set((target ?? []).map(row => row.transportadora_id));
+  const conflictIds = sourceIds.filter(id => targetIds.has(id));
+  let conflictNames: string[] = [];
+  if (conflictIds.length) {
+    const { data: carriers, error: carrierError } = await db().from("transportadoras").select("id,nome").in("id", conflictIds).order("nome");
+    if (carrierError) throw carrierError;
+    conflictNames = (carriers ?? []).map(carrier => carrier.nome);
+  }
+  return { count: sourceIds.length, conflictNames };
+}
+
+export async function moveCarrierReceipts(origin: Period, destination: Period) {
+  const preview = await previewCarrierReceiptMove(origin, destination);
+  if (preview.conflictNames.length) throw new Error(`Conflito no destino: ${preview.conflictNames.join(", ")}.`);
+  const { data, error } = await db()
+    .from("recebimentos_transportadoras")
+    .update({ ...destination, data_referencia: periodReference(destination) })
+    .match(origin)
+    .select("id");
+  if (error?.code === "23505") throw new Error("O período de destino recebeu lançamentos conflitantes. Nenhum registro foi movido.");
+  if (error) throw error;
+  return data?.length ?? 0;
+}
+
 export async function loadRiderSheet(period: Period) {
   const [{ data: riders, error: riderError }, { data: payments, error: paymentError }, { data: discounts, error: discountError }] = await Promise.all([
     db().from("motoboys").select("id,nome,tipo_pagamento,ativo").eq("ativo", true).order("nome"),
