@@ -35,6 +35,29 @@ export async function createCarrier(nome: string, tipoPagamento: "semanal" | "qu
   return data;
 }
 
+export async function updateCarrier(id: string, nome: string, tipoPagamento: "semanal" | "quinzenal") {
+  const normalizedName = nome.trim().replace(/\s+/g, " ").toUpperCase();
+  if (!normalizedName) throw new Error("Informe o nome da transportadora.");
+  const { data: duplicate, error: lookupError } = await db()
+    .from("transportadoras")
+    .select("id")
+    .ilike("nome", normalizedName)
+    .neq("id", id)
+    .limit(1)
+    .maybeSingle();
+  if (lookupError) throw lookupError;
+  if (duplicate) throw new Error("Esta transportadora já está cadastrada.");
+  const { data, error } = await db()
+    .from("transportadoras")
+    .update({ nome: normalizedName, tipo_pagamento: tipoPagamento })
+    .eq("id", id)
+    .select("id,nome,tipo_pagamento,ativo")
+    .single();
+  if (error?.code === "23505") throw new Error("Esta transportadora já está cadastrada.");
+  if (error) throw error;
+  return data;
+}
+
 async function ensureFastCarrier() {
   const { data, error } = await db()
     .from("transportadoras")
@@ -56,8 +79,22 @@ async function ensureFastCarrier() {
   }
 }
 
+async function ensureHpjIsFortnightly() {
+  const { data, error } = await db()
+    .from("transportadoras")
+    .select("id,tipo_pagamento")
+    .ilike("nome", "HPJ")
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  if (data && data.tipo_pagamento !== "quinzenal") {
+    const { error: updateError } = await db().from("transportadoras").update({ tipo_pagamento: "quinzenal" }).eq("id", data.id);
+    if (updateError) throw updateError;
+  }
+}
+
 export async function loadCarrierSheet(period: Period) {
-  await ensureFastCarrier();
+  await Promise.all([ensureFastCarrier(), ensureHpjIsFortnightly()]);
   const [{ data: carriers, error: carrierError }, { data: receipts, error: receiptError }] = await Promise.all([
     db().from("transportadoras").select("id,nome,tipo_pagamento,ativo").eq("ativo", true).order("nome"),
     db().from("recebimentos_transportadoras").select("*").match(period),
