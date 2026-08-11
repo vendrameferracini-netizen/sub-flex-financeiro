@@ -1,6 +1,7 @@
 import { getSupabase } from "./supabase";
 
 export type Period = { tipo_periodo: "semanal" | "quinzenal"; numero_periodo: number; mes: number; ano: number };
+export type WeeklyCalendarEntry = { ano: number; mes: number; numero_semana: number; data_inicio: string; data_fim: string; quinzena: 1 | 2 };
 
 function db() {
   const client = getSupabase();
@@ -12,6 +13,18 @@ export async function listPartners() {
   const { data, error } = await db().from("socios").select("id,nome,percentual_participacao").eq("ativo", true).order("nome");
   if (error) throw error;
   return data ?? [];
+}
+
+export async function loadWeeklyCalendar(mes: number, ano: number) {
+  const { data, error } = await db().from("calendario_competencias_semanais").select("ano,mes,numero_semana,data_inicio,data_fim,quinzena").eq("mes", mes).eq("ano", ano).order("numero_semana");
+  if (error) throw error;
+  return (data ?? []) as WeeklyCalendarEntry[];
+}
+
+export async function saveWeeklyCalendar(entries: WeeklyCalendarEntry[]) {
+  if (!entries.length) return;
+  const { error } = await db().from("calendario_competencias_semanais").upsert(entries, { onConflict: "ano,mes,numero_semana" });
+  if (error) throw error;
 }
 
 export async function createCarrier(nome: string, tipoPagamento: "semanal" | "quinzenal") {
@@ -245,20 +258,42 @@ export async function saveSettings(values: Record<string, string>) {
   if (error) throw error;
 }
 
+async function loadSummaryRiderPayments(period: Period) {
+  const columns = "id,valor_liquido,status,pago_por_socio_id";
+  const { data: direct, error: directError } = await db().from("pagamentos_motoboys").select(columns).match(period).neq("status", "cancelado");
+  if (directError) throw directError;
+  if (period.tipo_periodo === "semanal") return { payments: direct ?? [], fortnightly: [], weekly: direct ?? [], includedWeeks: [period.numero_periodo] };
+
+  const { data: calendar, error: calendarError } = await db().from("calendario_competencias_semanais").select("numero_semana").eq("mes", period.mes).eq("ano", period.ano).eq("quinzena", period.numero_periodo).order("numero_semana");
+  if (calendarError) throw calendarError;
+  const includedWeeks = [...new Set((calendar ?? []).map(row => Number(row.numero_semana)))];
+  let weekly: typeof direct = [];
+  if (includedWeeks.length) {
+    const { data, error } = await db().from("pagamentos_motoboys").select(columns).eq("tipo_periodo", "semanal").eq("mes", period.mes).eq("ano", period.ano).in("numero_periodo", includedWeeks).neq("status", "cancelado");
+    if (error) throw error;
+    weekly = data ?? [];
+  }
+  const payments = [...new Map([...(direct ?? []), ...(weekly ?? [])].map(row => [row.id, row])).values()];
+  return { payments, fortnightly: direct ?? [], weekly: weekly ?? [], includedWeeks };
+}
+
 export async function loadFinancialSummary(period: Period) {
   const range = periodDateRange(period);
-  const [{ data: receipts, error: e1 }, { data: payments, error: e2 }, { data: costs, error: e3 }, { data: partners, error: e4 }] = await Promise.all([
+  const [{ data: receipts, error: e1 }, riderSummary, { data: costs, error: e3 }, { data: partners, error: e4 }] = await Promise.all([
     db().from("recebimentos_transportadoras").select("valor,status,recebido_por_socio_id").match(period).neq("status", "cancelado"),
-    db().from("pagamentos_motoboys").select("valor_liquido,status,pago_por_socio_id").match(period).neq("status", "cancelado"),
+    loadSummaryRiderPayments(period),
     db().from("custos").select("valor,status,pago_por_socio_id").eq("mes", period.mes).eq("ano", period.ano).gte("data", range.start).lte("data", range.end).neq("status", "cancelado"),
     db().from("socios").select("id,nome,percentual_participacao").eq("ativo", true),
   ]);
-  if (e1 || e2 || e3 || e4) throw e1 || e2 || e3 || e4;
+  if (e1 || e3 || e4) throw e1 || e3 || e4;
+  const payments = riderSummary.payments;
   const received = (receipts ?? []).filter(x=>x.status==="recebido").reduce((a,x)=>a+Number(x.valor),0);
   const paidRiders = (payments ?? []).filter(x=>x.status==="pago").reduce((a,x)=>a+Number(x.valor_liquido),0);
+  const paidRidersFortnightly = riderSummary.fortnightly.filter(x=>x.status==="pago").reduce((a,x)=>a+Number(x.valor_liquido),0);
+  const paidRidersWeekly = riderSummary.weekly.filter(x=>x.status==="pago").reduce((a,x)=>a+Number(x.valor_liquido),0);
   const paidCosts = (costs ?? []).filter(x=>x.status==="pago").reduce((a,x)=>a+Number(x.valor),0);
   const byPartner = (partners ?? []).map(p=>({ ...p, received:(receipts??[]).filter(x=>x.status==="recebido"&&x.recebido_por_socio_id===p.id).reduce((a,x)=>a+Number(x.valor),0), paid:(payments??[]).filter(x=>x.status==="pago"&&x.pago_por_socio_id===p.id).reduce((a,x)=>a+Number(x.valor_liquido),0)+(costs??[]).filter(x=>x.status==="pago"&&x.pago_por_socio_id===p.id).reduce((a,x)=>a+Number(x.valor),0) }));
-  return { received, paidRiders, paidCosts, profit: received-paidRiders-paidCosts, partners: byPartner };
+  return { received, paidRiders, paidRidersFortnightly, paidRidersWeekly, includedWeeks: riderSummary.includedWeeks, paidCosts, profit: received-paidRiders-paidCosts, partners: byPartner };
 }
 
 export async function loadClosures(period: Period) {
