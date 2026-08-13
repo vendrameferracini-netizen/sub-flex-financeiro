@@ -344,6 +344,61 @@ export async function loadFinancialSummary(period: Period) {
   return { received, paidRiders, paidRidersFortnightly, paidRidersWeekly, includedWeeks: riderSummary.includedWeeks, paidCosts, profit: received-paidRiders-paidCosts, partners: byPartner };
 }
 
+export type BiFilters = { ano: number; mesInicial: number; mesFinal: number; socioId?: string | null };
+
+export async function loadFinancialBI(filters: BiFilters) {
+  const { ano, mesInicial, mesFinal, socioId } = filters;
+  const [receiptsResult, paymentsResult, costsResult, advancesResult, partnersResult, calendarResult] = await Promise.all([
+    db().from("recebimentos_transportadoras").select("id,valor,status,recebido_por_socio_id,tipo_periodo,numero_periodo,mes,ano,transportadoras(nome)").eq("ano", ano).gte("mes", mesInicial).lte("mes", mesFinal).neq("status", "cancelado"),
+    db().from("pagamentos_motoboys").select("id,valor_liquido,valor_vales,valor_extravios,status,pago_por_socio_id,tipo_periodo,numero_periodo,mes,ano").eq("ano", ano).gte("mes", mesInicial).lte("mes", mesFinal).neq("status", "cancelado"),
+    db().from("custos").select("id,valor,status,pago_por_socio_id,data,mes,ano").eq("ano", ano).gte("mes", mesInicial).lte("mes", mesFinal).neq("status", "cancelado"),
+    db().from("vales_extravios").select("id,tipo,valor,status,realizado_por_socio_id,periodo_desconto,mes_desconto,ano_desconto,motoboys(tipo_pagamento)").eq("ano_desconto", ano).gte("mes_desconto", mesInicial).lte("mes_desconto", mesFinal).neq("status", "cancelado"),
+    db().from("socios").select("id,nome,percentual_participacao").eq("ativo", true),
+    db().from("calendario_competencias_semanais").select("mes,numero_semana,quinzena").eq("ano", ano).gte("mes", mesInicial).lte("mes", mesFinal),
+  ]);
+  const error = receiptsResult.error || paymentsResult.error || costsResult.error || advancesResult.error || partnersResult.error || calendarResult.error;
+  if (error) throw error;
+  const partners = partnersResult.data ?? [], calendar = calendarResult.data ?? [];
+  const ownerMatches = (id: string | null) => !socioId || id === socioId;
+  const periods = Array.from({ length: mesFinal - mesInicial + 1 }, (_, monthIndex) => [1, 2].map(numero => ({ mes: mesInicial + monthIndex, numero }))).flat();
+  const rows = periods.map(({ mes, numero }) => {
+    const includedWeeks = calendar.filter(item => item.mes === mes && item.quinzena === numero).map(item => Number(item.numero_semana));
+    const receipts = (receiptsResult.data ?? []).filter(item => item.mes === mes && item.tipo_periodo === "quinzenal" && item.numero_periodo === numero && item.status === "recebido" && ownerMatches(item.recebido_por_socio_id));
+    const fortnightlyPayments = (paymentsResult.data ?? []).filter(item => item.mes === mes && item.tipo_periodo === "quinzenal" && item.numero_periodo === numero && item.status === "pago" && ownerMatches(item.pago_por_socio_id));
+    const weeklyPayments = (paymentsResult.data ?? []).filter(item => item.mes === mes && item.tipo_periodo === "semanal" && includedWeeks.includes(Number(item.numero_periodo)) && item.status === "pago" && ownerMatches(item.pago_por_socio_id));
+    const payments = [...new Map([...fortnightlyPayments, ...weeklyPayments].map(item => [item.id, item])).values()];
+    const startDay = numero === 1 ? 1 : 16, endDay = numero === 1 ? 15 : new Date(ano, mes, 0).getDate();
+    const costs = (costsResult.data ?? []).filter(item => item.mes === mes && item.status === "pago" && Number(String(item.data).slice(8, 10)) >= startDay && Number(String(item.data).slice(8, 10)) <= endDay && ownerMatches(item.pago_por_socio_id));
+    const advances = (advancesResult.data ?? []).filter(item => {
+      if (item.mes_desconto !== mes || !ownerMatches(item.realizado_por_socio_id)) return false;
+      const riderRelation = item.motoboys as unknown as { tipo_pagamento?: string } | { tipo_pagamento?: string }[] | null;
+      const paymentType = Array.isArray(riderRelation) ? riderRelation[0]?.tipo_pagamento : riderRelation?.tipo_pagamento;
+      return paymentType === "semanal"
+        ? includedWeeks.includes(Number(item.periodo_desconto))
+        : item.periodo_desconto === numero;
+    });
+    const receita = receipts.reduce((sum, item) => sum + Number(item.valor), 0);
+    const motoboys = payments.reduce((sum, item) => sum + Number(item.valor_liquido), 0);
+    const custos = costs.reduce((sum, item) => sum + Number(item.valor), 0);
+    const vales = advances.filter(item => item.tipo === "vale").reduce((sum, item) => sum + Number(item.valor), 0);
+    const extravios = advances.filter(item => item.tipo === "extravio").reduce((sum, item) => sum + Number(item.valor), 0);
+    const lucro = receita - motoboys - custos;
+    const partnerStats = partners.map(partner => ({ ...partner, received: receipts.filter(item => item.recebido_por_socio_id === partner.id).reduce((sum, item) => sum + Number(item.valor), 0), paid: payments.filter(item => item.pago_por_socio_id === partner.id).reduce((sum, item) => sum + Number(item.valor_liquido), 0) + costs.filter(item => item.pago_por_socio_id === partner.id).reduce((sum, item) => sum + Number(item.valor), 0) }));
+    const carrierTotals = new Map<string, number>();
+    for (const item of receipts) {
+      const relation = item.transportadoras as unknown as { nome?: string } | { nome?: string }[] | null;
+      const name = (Array.isArray(relation) ? relation[0]?.nome : relation?.nome) ?? "Não informada";
+      carrierTotals.set(name, (carrierTotals.get(name) ?? 0) + Number(item.valor));
+    }
+    return { ano, mes, numero, label: `${String(monthNamesForBI[mes - 1])}/${String(ano).slice(2)} - ${numero}ª`, receita, motoboys, custos, vales, extravios, lucro, margem: receita ? lucro / receita * 100 : 0, includedWeeks, partners: partnerStats, carriers: [...carrierTotals].map(([nome, value]) => ({ nome, receita: value })) };
+  });
+  const carriers = new Map<string, number>();
+  for (const item of receiptsResult.data ?? []) if (item.status === "recebido" && ownerMatches(item.recebido_por_socio_id)) { const relation = item.transportadoras as unknown as { nome?: string } | { nome?: string }[] | null; const name = (Array.isArray(relation) ? relation[0]?.nome : relation?.nome) ?? "Não informada"; carriers.set(name, (carriers.get(name) ?? 0) + Number(item.valor)); }
+  return { rows, carriers: [...carriers].map(([nome, receita]) => ({ nome, receita })).sort((a, b) => b.receita - a.receita), partners };
+}
+
+const monthNamesForBI = ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"];
+
 export async function loadClosures(period: Period) {
   const { data, error } = await db().from("fechamentos").select("*,repasses_socios(*)").match(period).maybeSingle();
   if (error) throw error;
