@@ -71,6 +71,55 @@ export async function updateCarrier(id: string, nome: string, tipoPagamento: "se
   return data;
 }
 
+export async function setCarrierActive(id: string, ativo: boolean) {
+  const { error } = await db().from("transportadoras").update({ ativo }).eq("id", id);
+  if (error) throw error;
+}
+
+export async function createRider(nome: string, tipoPagamento: "semanal" | "quinzenal") {
+  const normalizedName = nome.trim().replace(/\s+/g, " ");
+  if (!normalizedName) throw new Error("Informe o nome do motoboy.");
+  const { data: existing, error: lookupError } = await db().from("motoboys").select("id").ilike("nome", normalizedName).limit(1).maybeSingle();
+  if (lookupError) throw lookupError;
+  if (existing) throw new Error("Este motoboy já está cadastrado.");
+  const { data, error } = await db().from("motoboys").insert({ nome: normalizedName, tipo_pagamento: tipoPagamento, ativo: true }).select("id,nome,tipo_pagamento,ativo").single();
+  if (error?.code === "23505") throw new Error("Este motoboy já está cadastrado.");
+  if (error) throw error;
+  return data;
+}
+
+export async function updateRider(id: string, nome: string, tipoPagamento: "semanal" | "quinzenal") {
+  const normalizedName = nome.trim().replace(/\s+/g, " ");
+  if (!normalizedName) throw new Error("Informe o nome do motoboy.");
+  const { data: duplicate, error: lookupError } = await db().from("motoboys").select("id").ilike("nome", normalizedName).neq("id", id).limit(1).maybeSingle();
+  if (lookupError) throw lookupError;
+  if (duplicate) throw new Error("Este motoboy já está cadastrado.");
+  const { data, error } = await db().from("motoboys").update({ nome: normalizedName, tipo_pagamento: tipoPagamento }).eq("id", id).select("id,nome,tipo_pagamento,ativo").single();
+  if (error?.code === "23505") throw new Error("Este motoboy já está cadastrado.");
+  if (error) throw error;
+  return data;
+}
+
+export async function setRiderActive(id: string, ativo: boolean) {
+  const { error } = await db().from("motoboys").update({ ativo }).eq("id", id);
+  if (error) throw error;
+}
+
+export async function riderHasHistory(id: string) {
+  const [{ count: payments, error: paymentError }, { count: advances, error: advanceError }] = await Promise.all([
+    db().from("pagamentos_motoboys").select("id", { count: "exact", head: true }).eq("motoboy_id", id),
+    db().from("vales_extravios").select("id", { count: "exact", head: true }).eq("motoboy_id", id),
+  ]);
+  if (paymentError || advanceError) throw paymentError || advanceError;
+  return Number(payments ?? 0) + Number(advances ?? 0) > 0;
+}
+
+export async function removeRiderSafely(id: string) {
+  const { data, error } = await db().rpc("remover_motoboy_sem_historico", { p_motoboy_id: id });
+  if (error) throw error;
+  return Boolean(data);
+}
+
 async function ensureFastCarrier() {
   const { data, error } = await db()
     .from("transportadoras")
@@ -107,9 +156,8 @@ async function ensureHpjIsFortnightly() {
 }
 
 export async function loadCarrierSheet(period: Period) {
-  await Promise.all([ensureFastCarrier(), ensureHpjIsFortnightly()]);
   const [{ data: carriers, error: carrierError }, { data: receipts, error: receiptError }] = await Promise.all([
-    db().from("transportadoras").select("id,nome,tipo_pagamento,ativo").eq("ativo", true).order("nome"),
+    db().from("transportadoras").select("id,nome,tipo_pagamento,ativo").order("nome"),
     db().from("recebimentos_transportadoras").select("*").match(period),
   ]);
   if (carrierError) throw carrierError;
@@ -178,7 +226,7 @@ export async function moveCarrierReceipts(origin: Period, destination: Period) {
 
 export async function loadRiderSheet(period: Period) {
   const [{ data: riders, error: riderError }, { data: payments, error: paymentError }, { data: discounts, error: discountError }] = await Promise.all([
-    db().from("motoboys").select("id,nome,tipo_pagamento,ativo").eq("ativo", true).order("nome"),
+    db().from("motoboys").select("id,nome,tipo_pagamento,ativo").order("nome"),
     db().from("pagamentos_motoboys").select("*").match(period),
     db().from("vales_extravios").select("id,motoboy_id,tipo,valor").eq("status", "pendente").eq("mes_desconto", period.mes).eq("ano_desconto", period.ano).eq("periodo_desconto", period.numero_periodo),
   ]);
