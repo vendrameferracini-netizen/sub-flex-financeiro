@@ -306,23 +306,29 @@ export async function saveSettings(values: Record<string, string>) {
   if (error) throw error;
 }
 
+type ConsolidatedPayment = { id: string; valor_liquido: number | string; status: string; pago_por_socio_id: string | null; tipo_periodo: string; numero_periodo: number };
+
+export function consolidateRiderPayments<T extends ConsolidatedPayment>(payments: T[], period: Period, includedWeeks: number[]) {
+  const fortnightly = payments.filter(row => row.tipo_periodo === "quinzenal" && row.numero_periodo === period.numero_periodo);
+  const weekly = payments.filter(row => row.tipo_periodo === "semanal" && (period.tipo_periodo === "semanal" ? row.numero_periodo === period.numero_periodo : includedWeeks.includes(Number(row.numero_periodo))));
+  const consolidated = period.tipo_periodo === "semanal" ? weekly : [...new Map([...fortnightly, ...weekly].map(row => [row.id, row])).values()];
+  return { payments: consolidated, fortnightly: period.tipo_periodo === "quinzenal" ? fortnightly : [], weekly, includedWeeks: period.tipo_periodo === "semanal" ? [period.numero_periodo] : includedWeeks };
+}
+
 async function loadSummaryRiderPayments(period: Period) {
-  const columns = "id,valor_liquido,status,pago_por_socio_id";
-  const { data: direct, error: directError } = await db().from("pagamentos_motoboys").select(columns).match(period).neq("status", "cancelado");
-  if (directError) throw directError;
-  if (period.tipo_periodo === "semanal") return { payments: direct ?? [], fortnightly: [], weekly: direct ?? [], includedWeeks: [period.numero_periodo] };
+  const columns = "id,valor_liquido,status,pago_por_socio_id,tipo_periodo,numero_periodo";
+  if (period.tipo_periodo === "semanal") {
+    const { data, error } = await db().from("pagamentos_motoboys").select(columns).eq("mes", period.mes).eq("ano", period.ano).eq("tipo_periodo", "semanal").eq("numero_periodo", period.numero_periodo).neq("status", "cancelado");
+    if (error) throw error;
+    return consolidateRiderPayments((data ?? []) as ConsolidatedPayment[], period, [period.numero_periodo]);
+  }
 
   const { data: calendar, error: calendarError } = await db().from("calendario_competencias_semanais").select("numero_semana").eq("mes", period.mes).eq("ano", period.ano).eq("quinzena", period.numero_periodo).order("numero_semana");
   if (calendarError) throw calendarError;
   const includedWeeks = [...new Set((calendar ?? []).map(row => Number(row.numero_semana)))];
-  let weekly: typeof direct = [];
-  if (includedWeeks.length) {
-    const { data, error } = await db().from("pagamentos_motoboys").select(columns).eq("tipo_periodo", "semanal").eq("mes", period.mes).eq("ano", period.ano).in("numero_periodo", includedWeeks).neq("status", "cancelado");
-    if (error) throw error;
-    weekly = data ?? [];
-  }
-  const payments = [...new Map([...(direct ?? []), ...(weekly ?? [])].map(row => [row.id, row])).values()];
-  return { payments, fortnightly: direct ?? [], weekly: weekly ?? [], includedWeeks };
+  const { data, error } = await db().from("pagamentos_motoboys").select(columns).eq("mes", period.mes).eq("ano", period.ano).in("tipo_periodo", ["quinzenal", "semanal"]).neq("status", "cancelado");
+  if (error) throw error;
+  return consolidateRiderPayments((data ?? []) as ConsolidatedPayment[], period, includedWeeks);
 }
 
 export async function loadFinancialSummary(period: Period) {
@@ -340,7 +346,7 @@ export async function loadFinancialSummary(period: Period) {
   const paidRidersFortnightly = riderSummary.fortnightly.filter(x=>x.status==="pago").reduce((a,x)=>a+Number(x.valor_liquido),0);
   const paidRidersWeekly = riderSummary.weekly.filter(x=>x.status==="pago").reduce((a,x)=>a+Number(x.valor_liquido),0);
   const paidCosts = (costs ?? []).filter(x=>x.status==="pago").reduce((a,x)=>a+Number(x.valor),0);
-  const byPartner = (partners ?? []).map(p=>({ ...p, received:(receipts??[]).filter(x=>x.status==="recebido"&&x.recebido_por_socio_id===p.id).reduce((a,x)=>a+Number(x.valor),0), paid:(payments??[]).filter(x=>x.status==="pago"&&x.pago_por_socio_id===p.id).reduce((a,x)=>a+Number(x.valor_liquido),0)+(costs??[]).filter(x=>x.status==="pago"&&x.pago_por_socio_id===p.id).reduce((a,x)=>a+Number(x.valor),0) }));
+  const byPartner = (partners ?? []).map(p=>{const paidFortnightly=riderSummary.fortnightly.filter(x=>x.status==="pago"&&x.pago_por_socio_id===p.id).reduce((a,x)=>a+Number(x.valor_liquido),0),paidWeekly=riderSummary.weekly.filter(x=>x.status==="pago"&&x.pago_por_socio_id===p.id).reduce((a,x)=>a+Number(x.valor_liquido),0),paidCosts=(costs??[]).filter(x=>x.status==="pago"&&x.pago_por_socio_id===p.id).reduce((a,x)=>a+Number(x.valor),0);return{ ...p, received:(receipts??[]).filter(x=>x.status==="recebido"&&x.recebido_por_socio_id===p.id).reduce((a,x)=>a+Number(x.valor),0), paidFortnightly, paidWeekly, paidCosts, paid:paidFortnightly+paidWeekly+paidCosts }});
   return { received, paidRiders, paidRidersFortnightly, paidRidersWeekly, includedWeeks: riderSummary.includedWeeks, paidCosts, profit: received-paidRiders-paidCosts, partners: byPartner };
 }
 
@@ -365,9 +371,8 @@ export async function loadFinancialBI(filters: BiFilters) {
   const rows = periods.map(({ mes, numero }) => {
     const includedWeeks = calendar.filter(item => item.mes === mes && item.quinzena === numero).map(item => Number(item.numero_semana));
     const receipts = (receiptsResult.data ?? []).filter(item => item.mes === mes && item.tipo_periodo === "quinzenal" && item.numero_periodo === numero && item.status === "recebido" && ownerMatches(item.recebido_por_socio_id));
-    const fortnightlyPayments = (paymentsResult.data ?? []).filter(item => item.mes === mes && item.tipo_periodo === "quinzenal" && item.numero_periodo === numero && item.status === "pago" && ownerMatches(item.pago_por_socio_id));
-    const weeklyPayments = (paymentsResult.data ?? []).filter(item => item.mes === mes && item.tipo_periodo === "semanal" && includedWeeks.includes(Number(item.numero_periodo)) && item.status === "pago" && ownerMatches(item.pago_por_socio_id));
-    const payments = [...new Map([...fortnightlyPayments, ...weeklyPayments].map(item => [item.id, item])).values()];
+    const periodPayments = (paymentsResult.data ?? []).filter(item => item.mes === mes && item.status === "pago" && ownerMatches(item.pago_por_socio_id));
+    const { payments } = consolidateRiderPayments(periodPayments as ConsolidatedPayment[], { mes, ano, tipo_periodo: "quinzenal", numero_periodo: numero }, includedWeeks);
     const startDay = numero === 1 ? 1 : 16, endDay = numero === 1 ? 15 : new Date(ano, mes, 0).getDate();
     const costs = (costsResult.data ?? []).filter(item => item.mes === mes && item.status === "pago" && Number(String(item.data).slice(8, 10)) >= startDay && Number(String(item.data).slice(8, 10)) <= endDay && ownerMatches(item.pago_por_socio_id));
     const advances = (advancesResult.data ?? []).filter(item => {
